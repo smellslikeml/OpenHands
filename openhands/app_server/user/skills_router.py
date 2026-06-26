@@ -6,6 +6,11 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 import openhands
+from openhands.app_server.user.skill_audit import (
+    SkillAuditReport,
+    audit_skill_directories,
+    content_digest,
+)
 from openhands.app_server.utils.dependencies import get_dependencies
 from openhands.app_server.utils.logger import openhands_logger as logger
 
@@ -23,6 +28,7 @@ class SkillInfo(BaseModel):
     type: str  # 'knowledge', 'repo', or 'task'
     source: str  # 'global' or 'user'
     triggers: list[str] | None = None
+    digest: str | None = None  # SHA-256 content address of the definition file
 
 
 class SkillPage(BaseModel):
@@ -86,12 +92,20 @@ def _load_skills_from_dir(skills_dir: Path, source: str) -> list[SkillInfo]:
             skill_type = fm.get('type', 'knowledge')
             triggers = fm.get('triggers') or None
 
+            # Content-address the definition so identical skills copied
+            # between installations collapse to the same digest.
+            try:
+                digest = content_digest(md_file.read_bytes())
+            except OSError:
+                digest = None
+
             skills.append(
                 SkillInfo(
                     name=name,
                     type=skill_type,
                     source=source,
                     triggers=triggers,
+                    digest=digest,
                 )
             )
         except Exception as e:
@@ -153,3 +167,31 @@ async def search_skills(
     )
 
     return SkillPage(items=page, next_page_id=next_page_id)
+
+
+@router.get(
+    '/audit',
+    response_model=SkillAuditReport,
+)
+async def audit_skills(
+    drift_threshold: Annotated[
+        float,
+        Query(
+            title='Minimum Jaccard similarity for a non-identical pair to count '
+            'as prompt drift',
+            gt=0.0,
+            le=1.0,
+        ),
+    ] = 0.85,
+) -> SkillAuditReport:
+    """Audit available skill definitions for duplication and prompt drift.
+
+    Content-addresses every global and user skill file with SHA-256 to surface
+    exact duplicates, and reports near-duplicate pairs (high Jaccard similarity
+    but not byte-identical) as prompt drift. The audit is deterministic and runs
+    no LLM, so the same skill set always yields the same report.
+    """
+    return audit_skill_directories(
+        [(GLOBAL_SKILLS_DIR, 'global'), (USER_SKILLS_DIR, 'user')],
+        drift_threshold=drift_threshold,
+    )
